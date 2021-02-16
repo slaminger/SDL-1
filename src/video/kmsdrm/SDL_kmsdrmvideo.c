@@ -28,6 +28,9 @@
 #include "SDL_kmsdrmmisc_c.h"
 #include "SDL_kmsdrmcolordef.h"
 
+#include <rga/RgaApi.h>
+#include <rga/RockchipRgaMacro.h>
+
 #define KMSDRM_DRIVER_NAME "kmsdrm"
 
 static int KMSDRM_TripleBufferingThread(void *d);
@@ -135,6 +138,8 @@ void KMSDRM_RegisterVidMode(_THIS, int width, int height)
 
 int KMSDRM_VideoInit(_THIS, SDL_PixelFormat *vformat)
 {
+	c_RkRgaInit();
+
 	if ( (drm_fd = KMSDRM_OpenDevice()) < 0 ) {
 		SDL_SetError("Could not find any (capable) DRM device.\n");
 		goto vidinit_fail;
@@ -334,6 +339,12 @@ static int KMSDRM_CreateFramebuffer(_THIS, int idx, Uint32 width, Uint32 height,
 		goto createfb_fail_rmfb;
 	}
 
+	if ( drmPrimeHandleToFD(drm_fd, req_map->handle, DRM_RDWR | DRM_CLOEXEC, &drm_buffers[idx].prime_fd) < 0 )
+	{
+		SDL_SetError("Map data request failed, %s.\n", strerror(errno));
+		goto createfb_fail_rmfb;
+	}
+
 	// Map the framebuffer
 	drm_buffers[idx].map = mmap(0, req_create->size, PROT_READ | PROT_WRITE, MAP_SHARED, drm_fd, req_map->offset);
 	if ( drm_map == MAP_FAILED ) {
@@ -438,6 +449,12 @@ SDL_Surface *KMSDRM_SetVideoMode(_THIS, SDL_Surface *current,
 	// Lock the event thread, in multi-threading environments
 	SDL_Lock_EventThread();
 
+	width = 320;
+	height = 480;
+
+	printf("XXX KMSDRM_SetVideoMode width %d height %d hidden %d %d current %d %d\n",
+			width, height, (int)this->hidden->w, (int)this->hidden->h, (int)current->w, (int)current->h);
+
 	// If we have set a video mode previously, now we need to clean up.
 	if ( drm_active_pipe ) {
 		if ( drm_triplebuf_thread ) {
@@ -498,6 +515,9 @@ SDL_Surface *KMSDRM_SetVideoMode(_THIS, SDL_Surface *current,
 	int n_buf = ((flags & SDL_TRIPLEBUF) == SDL_TRIPLEBUF) ? 3 : 
 				((flags & SDL_TRIPLEBUF) == SDL_DOUBLEBUF) ? 2 : 1;
 
+	// 4th is for presentation
+	n_buf++;
+
 	// Initialize how many framebuffers were requested
 	kmsdrm_dbg_printf("Creating %d framebuffers!\n", n_buf);
 	for (int i = 0; i < n_buf; i++) {
@@ -554,7 +574,7 @@ SDL_Surface *KMSDRM_SetVideoMode(_THIS, SDL_Surface *current,
 		attempt_add_prop2(this, req, pipe->plane, "SRC_W", 0, width << 16);
 		attempt_add_prop2(this, req, pipe->plane, "SRC_H", 0, height << 16);
 
-		if (KMSDRM_SetCrtcParams(this, req, pipe->plane, width, height,
+		if (KMSDRM_SetCrtcParams(this, req, pipe->plane, 320, 480,
 					 closest_mode->hdisplay, closest_mode->vdisplay)) {
 			fprintf(stderr, "Unable to set CRTC params: %s\n", strerror(errno));
 			goto setvidmode_fail_req2;
@@ -706,7 +726,7 @@ static int KMSDRM_TripleBufferingThread(void *d)
 
 		/* flip display */
 		if (!add_property(this, req, drm_active_pipe->plane,
-				  "FB_ID", 0, drm_buffers[drm_queued_buffer].buf_id))
+				  "FB_ID", 0, drm_buffers[3].buf_id))
 			fprintf(stderr, "Unable to set FB_ID property: %s\n", strerror(errno));
 
 		int rc = drmModeAtomicCommit(drm_fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
@@ -773,6 +793,32 @@ static int KMSDRM_FlipHWSurface(_THIS, SDL_Surface *surface)
 	if ( drm_shadow_buffer ) {
 		KMSDRM_BlitSWBuffer(this, &drm_buffers[drm_back_buffer]);
 	}
+
+	int in_w = surface->w;
+	int in_h = surface->h;
+	int in_x = (320 - surface->w)/2;
+	int in_y = (480 - surface->h)/2;
+
+	int out_x = 0;
+	int out_y = 0;
+	int out_w = 480;
+	int out_h = 320;
+
+	rga_info_t s = {
+		.fd = drm_buffers[drm_back_buffer].prime_fd,
+		.rect = { in_x, in_y, in_w, in_h, 320, 480, RK_FORMAT_BGRA_8888 },
+		.rotation = HAL_TRANSFORM_ROT_270,
+		.mmuFlag = 1,
+		.scale_mode = 0x2,
+	};
+
+	rga_info_t d = {
+		.fd = drm_buffers[3].prime_fd,
+		.rect = { out_y, out_x, out_h, out_w, 320, 480, RK_FORMAT_BGRA_8888 },
+		.mmuFlag = 1,
+	};
+
+	int ret = c_RkRgaBlit(&s, &d, NULL);
 
 	// Either wait for VSync or for buffer acquire
 	if ( (surface->flags & SDL_TRIPLEBUF) == SDL_DOUBLEBUF ) {
@@ -869,6 +915,7 @@ void KMSDRM_VideoQuit(_THIS)
 		this->screen->pixels = NULL;
 	}
 
+	c_RkRgaDeInit();
 	KMSDRM_ExitInput(this);
 }
 
