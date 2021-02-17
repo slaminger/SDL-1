@@ -28,7 +28,13 @@
 #include "SDL_kmsdrmmisc_c.h"
 #include "SDL_kmsdrmcolordef.h"
 
+#include <rga/RgaApi.h>
+#include <rga/RockchipRgaMacro.h>
+
 #define KMSDRM_DRIVER_NAME "kmsdrm"
+
+#define ALIGN(val, align) (((val) + (align) - 1) & ~((align) - 1))
+
 
 static int KMSDRM_TripleBufferingThread(void *d);
 static void KMSDRM_TripleBufferInit(_THIS);
@@ -108,6 +114,8 @@ static int KMSDRM_Available(void)
 
 int KMSDRM_VideoInit(_THIS, SDL_PixelFormat *vformat)
 {
+	c_RkRgaInit();
+
 	if ( (drm_fd = KMSDRM_OpenDevice()) < 0 ) {
 		SDL_SetError("Could not find any (capable) DRM device.\n");
 		goto vidinit_fail;
@@ -248,6 +256,19 @@ static int KMSDRM_CreateFramebuffer(_THIS, int idx, Uint32 width, Uint32 height,
 	 * A multi planar dumb buffers' height is a multiple of the requested height,
 	 * and varies depending on the color format used.
 	 **/
+
+	// Force 4th buf to native res
+    if (idx == 3)
+    {
+        width = 320;
+        height = 480;
+    }
+    else
+    {
+        width = ALIGN(width, 32);
+        height = ALIGN(height, 32);
+    }
+
 	req_create->width = width;
 	req_create->height = height * color_def->h_factor;
 	req_create->bpp = color_def->bpp;
@@ -283,6 +304,12 @@ static int KMSDRM_CreateFramebuffer(_THIS, int idx, Uint32 width, Uint32 height,
 	req_map->handle = req_create->handle;
 	if ( drmIoctl(drm_fd, DRM_IOCTL_MODE_MAP_DUMB, req_map) < 0 ) {
 		SDL_SetError("Map data request failed, %s.\n", strerror(errno));
+		goto createfb_fail_rmfb;
+	}
+
+	if ( drmPrimeHandleToFD(drm_fd, req_map->handle, DRM_RDWR | DRM_CLOEXEC, &drm_buffers[idx].prime_fd) < 0 )
+	{
+		SDL_SetError("Get prime fd request failed, %s.\n", strerror(errno));
 		goto createfb_fail_rmfb;
 	}
 
@@ -358,6 +385,10 @@ static int KMSDRM_SetCrtcParams(_THIS, drmModeAtomicReqPtr req, Uint32 plane_id,
 		return 1;
 	}
 
+	// XXX don't pad as we blit with rga from offset 0
+	crtc_w = mode_width;
+	crtc_h = mode_height;
+
 	if (!add_property(this, req, plane_id, "CRTC_X", 0, (mode_width - crtc_w) / 2))
 		return 1;
 
@@ -426,6 +457,9 @@ static SDL_Surface *KMSDRM_SetVideoMode2(_THIS, SDL_Surface *current,
 	int n_buf = ((flags & SDL_TRIPLEBUF) == SDL_TRIPLEBUF) ? 3 : 
 				((flags & SDL_TRIPLEBUF) == SDL_DOUBLEBUF) ? 2 : 1;
 
+	// 4th is for presentation
+	n_buf = 4;
+
 	// Initialize how many framebuffers were requested
 	kmsdrm_dbg_printf("Creating %d framebuffers!\n", n_buf);
 	for (int i = 0; i < n_buf; i++) {
@@ -473,19 +507,19 @@ static SDL_Surface *KMSDRM_SetVideoMode2(_THIS, SDL_Surface *current,
 		req = drmModeAtomicDuplicate(req);
 
 		// Setup plane->crtc pipe
-		attempt_add_prop2(this, req, pipe->plane, "FB_ID", 0, drm_buffers[drm_front_buffer].buf_id);
+		attempt_add_prop2(this, req, pipe->plane, "FB_ID", 0, drm_buffers[3].buf_id);
 		attempt_add_prop2(this, req, pipe->plane, "CRTC_ID", 0, pipe->crtc);
 
 		// Setup plane details
 		attempt_add_prop2(this, req, pipe->plane, "SRC_X", 0, 0);
 		attempt_add_prop2(this, req, pipe->plane, "SRC_Y", 0, 0);
-		attempt_add_prop2(this, req, pipe->plane, "SRC_W", 0, width << 16);
-		attempt_add_prop2(this, req, pipe->plane, "SRC_H", 0, height << 16);
+		attempt_add_prop2(this, req, pipe->plane, "SRC_W", 0, 320 << 16);
+		attempt_add_prop2(this, req, pipe->plane, "SRC_H", 0, 480 << 16);
 
 		drm_active_pipe = pipe;
 
-		if (KMSDRM_SetCrtcParams(this, req, pipe->plane, pipe->crtc, width, height,
-					 closest_mode->hdisplay, closest_mode->vdisplay, bpp)) {
+		if (KMSDRM_SetCrtcParams(this, req, pipe->plane, pipe->crtc, 320, 480,
+					 320, 480, bpp)) {
 			fprintf(stderr, "Unable to set CRTC params: %s\n", strerror(errno));
 			goto setvidmode_fail_req2;
 		}
@@ -659,7 +693,7 @@ static int KMSDRM_TripleBufferingThread(void *d)
 
 		/* flip display */
 		if (!add_property(this, req, drm_active_pipe->plane,
-				  "FB_ID", 0, drm_buffers[drm_queued_buffer].buf_id))
+				  "FB_ID", 0, drm_buffers[3].buf_id))
 			fprintf(stderr, "Unable to set FB_ID property: %s\n", strerror(errno));
 
 		int rc = drmModeAtomicCommit(drm_fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);
@@ -704,6 +738,46 @@ static int KMSDRM_FlipHWSurface(_THIS, SDL_Surface *surface)
 	if ( !drm_active_pipe )
 		return -2;
 
+	// blit current fb to our presentation fb
+    int in_w = 0;
+    int in_h = 0;
+    int in_x = 0;
+    int in_y = 0;
+
+    int fmt = drm_buffers[drm_back_buffer].req_create.bpp == 32 ? RK_FORMAT_BGRA_8888 : RK_FORMAT_RGB_565;
+
+    int pw = drm_buffers[drm_back_buffer].req_create.width;
+    int ph = drm_buffers[drm_back_buffer].req_create.height;
+    in_w = surface->w;
+    in_h = surface->h;
+    in_x = 0;
+    in_y = 0;
+    int rot = HAL_TRANSFORM_ROT_270;
+
+    int out_x = 0;
+    int out_y = 0;
+    int out_w = drm_buffers[3].req_create.height;
+    int out_h = drm_buffers[3].req_create.width;
+
+//    printf("XXX Flip pw %d ph %d in_w %d in_h %d out_w %d out_h %d\n",
+//            pw, ph, in_w, in_h, out_w, out_h);
+
+    rga_info_t s = {
+        .fd = drm_buffers[drm_back_buffer].prime_fd,
+        .rect = { in_x, in_y, in_w, in_h, pw, ph, fmt },
+        .rotation = rot,
+        .mmuFlag = 1,
+        .scale_mode = 0x2,
+    };
+
+    rga_info_t d = {
+        .fd = drm_buffers[3].prime_fd,
+        .rect = { out_y, out_x, out_h, out_w, 320, 480, fmt },
+        .mmuFlag = 1,
+    };
+
+    int ret = c_RkRgaBlit(&s, &d, NULL);
+
 	// Either wait for VSync or for buffer acquire
 	if ( (surface->flags & SDL_TRIPLEBUF) == SDL_DOUBLEBUF ) {
 		drmModeAtomicReqPtr req = drmModeAtomicDuplicate(this->hidden->drm_req);
@@ -716,7 +790,7 @@ static int KMSDRM_FlipHWSurface(_THIS, SDL_Surface *surface)
 			fprintf(stderr, "Unable to set CRTC params: %s\n", strerror(errno));
 
 		if (!add_property(this, req, drm_active_pipe->plane,
-				  "FB_ID", 0, drm_buffers[drm_back_buffer].buf_id))
+				  "FB_ID", 0, drm_buffers[3].buf_id))
 			fprintf(stderr, "Unable to set FB_ID property: %s\n", strerror(errno));
 
 		int rc = drmModeAtomicCommit(drm_fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, NULL);

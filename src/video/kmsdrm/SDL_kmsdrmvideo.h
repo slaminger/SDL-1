@@ -86,6 +86,7 @@ typedef struct drm_buffer {
     struct drm_mode_create_dumb req_create;
     struct drm_mode_map_dumb req_map;
     Uint32 buf_id;
+    int prime_fd;
     void *map;
 } drm_buffer;
 
@@ -115,7 +116,7 @@ struct SDL_PrivateVideoData {
     drm_pipe *active_pipe;
     drm_prop_storage *first_prop_store;
     drmModeAtomicReqPtr drm_req;
-    drm_buffer buffers[3];
+    drm_buffer buffers[4]; // 4th buffer is for presenting
     Uint32 mode_blob_id;
     Uint32 front_buffer;
     Uint32 back_buffer;
