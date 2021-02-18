@@ -569,7 +569,8 @@ static SDL_Surface *KMSDRM_SetVideoMode2(_THIS, SDL_Surface *current,
 
 	current->w = width;
 	current->h = height;
-	current->pitch = drm_buffers[0].req_create.pitch;
+    // resize pitch based on width not drm pitch
+	current->pitch = width * bpp / 8; //drm_buffers[0].req_create.pitch;
 
 	this->hidden->has_damage_clips = find_property(this, drm_active_pipe->plane,
 						       "FB_DAMAGE_CLIPS");
@@ -746,8 +747,8 @@ static int KMSDRM_FlipHWSurface(_THIS, SDL_Surface *surface)
 
     int fmt = drm_buffers[drm_back_buffer].req_create.bpp == 32 ? RK_FORMAT_BGRA_8888 : RK_FORMAT_RGB_565;
 
-    int pw = drm_buffers[drm_back_buffer].req_create.width;
-    int ph = drm_buffers[drm_back_buffer].req_create.height;
+    int pw = surface->w;
+    int ph = surface->h;
     in_w = surface->w;
     in_h = surface->h;
     in_x = 0;
